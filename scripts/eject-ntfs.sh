@@ -1,6 +1,8 @@
 #!/bin/bash
 # Unmount NTFS partitions and eject only the physical disks that hold them.
 # Usage: sudo eject-ntfs.sh [diskN ...]     (no args = every external disk with NTFS partitions)
+# May be allowed to run as root without a password (see install-helper.sh); inputs are validated.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
 if [ $# -gt 0 ]; then disks="$*"; else
   disks=$(for d in $(diskutil list external | awk '/^\/dev\/disk/ {print $1}'); do
             diskutil list "$d" | grep -qE "Windows_NTFS|Microsoft Basic Data" && basename "$d"; done)
@@ -10,6 +12,10 @@ status=0
 for d in $disks; do
   d=$(basename "$d")
   [[ "$d" =~ ^disk[0-9]+$ ]] || { echo "$d: invalid disk id"; continue; }
+  if ! diskutil info "$d" 2>/dev/null | grep -qE "Device Location: +External" \
+     || ! diskutil list "$d" 2>/dev/null | grep -qE "Windows_NTFS|Microsoft Basic Data"; then
+    echo "$d: not an external NTFS disk, skipped"; continue
+  fi
   busy=0
   for p in $(diskutil list "$d" | awk '/Windows_NTFS|Microsoft Basic Data/ {print $NF}'); do
     mp=$(mount | awk -v dev="/dev/$p" '$1==dev' | sed -E 's/^.* on (.*) \(.*$/\1/')
