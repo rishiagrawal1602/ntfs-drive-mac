@@ -169,10 +169,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         startDiskWatcher()
         refreshIcon()
+        // Opened by hand: show the menu so the user sees something happen. Skip right after
+        // login when "Launch at login" started it automatically.
+        let startedAtLogin = SMAppService.mainApp.status == .enabled && ProcessInfo.processInfo.systemUptime < 180
+        if !startedAtLogin {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.showMenuAtMouse() }
+        }
     }
 
     // Rebuild the menu every time it opens so it always shows live state.
     func menuNeedsUpdate(_ menu: NSMenu) { buildMenu() }
+
+    /// Opening the app again (Finder, Dock, Spotlight, Launchpad) pops the menu up at the mouse
+    /// pointer, so it's reachable even when the menu bar icon is hidden behind the notch.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showMenuAtMouse()
+        return false
+    }
+
+    private func showMenuAtMouse() {
+        NSApp.activate(ignoringOtherApps: true)
+        buildMenu()
+        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+    }
 
     // MARK: Menu
 
