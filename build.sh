@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 OUT="${1:-/Applications}"
-VERSION="2.0.0"
+VERSION="2.1.0"
 APP="$OUT/NTFS Drive.app"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -23,7 +23,8 @@ mkdir -p "$OUT"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$TMP/NTFSDrive" "$APP/Contents/MacOS/NTFSDrive"
-cp scripts/mount-ntfs.sh scripts/eject-ntfs.sh "$APP/Contents/Resources/"
+cp scripts/mount-ntfs.sh scripts/eject-ntfs.sh scripts/install-helper.sh scripts/uninstall-helper.sh \
+  "$APP/Contents/Resources/"
 chmod +x "$APP/Contents/Resources/"*.sh
 cp icon/NTFS.icns "$APP/Contents/Resources/AppIcon.icns"
 cat > "$APP/Contents/Info.plist" <<PLIST

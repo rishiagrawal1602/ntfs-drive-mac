@@ -15,6 +15,8 @@ It's a native **menu bar app** built on [macFUSE](https://macfuse.github.io/) an
 - **Notifications:** "Drive ready for writing", "Safe to unplug", and if a drive is busy, **which apps are using it**
 - **Helpful errors:** plain-language guidance for hibernated Windows drives and blocked disk access
 - **Safe:** falls back to read-only if a mount fails, and ejects only disks that hold NTFS partitions
+- **Password-free mounting** (optional): enter your password once, then mounting, auto-mount and eject never ask again. [How it works](#password-free-mounting)
+- **Custom names:** rename "Partition 1" to "Photos". The name is remembered for that partition, even after replugging, and shown in the menu and in Finder
 - **Launch at login** (toggle in the menu)
 - Mounts keep running after you quit the app (ntfs-3g runs in the background on its own)
 
@@ -53,12 +55,25 @@ The first time you open it, right-click → **Open** (the app is ad-hoc signed).
 
 The scripts also work without the app:
 ```bash
-sudo scripts/mount-ntfs.sh            # all NTFS partitions (or pass e.g. disk4s1)
-sudo scripts/eject-ntfs.sh            # all NTFS disks (or pass e.g. disk4)
-sudo NTFS_CLEAN=0 scripts/mount-ntfs.sh      # allow macOS ._ files
+sudo scripts/mount-ntfs.sh                    # all NTFS partitions
+sudo scripts/mount-ntfs.sh disk4s1:Photos     # one partition, with a custom name
+sudo scripts/mount-ntfs.sh --no-clean         # allow macOS ._ files
+sudo scripts/eject-ntfs.sh                    # all NTFS disks (or pass e.g. disk4)
 ```
 
 To see what the app detects: `"/Applications/NTFS Drive.app/Contents/MacOS/NTFSDrive" --scan`
+
+## Password-free mounting
+Turn on **Password-free mounting** in the menu and enter your password one last time. The app then:
+1. Copies `mount-ntfs.sh` and `eject-ntfs.sh` to `/Library/PrivilegedHelperTools/com.local.ntfsdrive/`, owned by root, so nobody can change them without admin rights.
+2. Adds `/etc/sudoers.d/ntfs-drive`, which lets **only your user** run **only those two scripts** as root without a password. The rule is checked with `visudo` before it's installed.
+
+The scripts validate every input: only `diskN`/`diskNsM` ids of **external NTFS** disks are accepted, and names are reduced to a safe single folder name. A drive with a crafted label can't make the script mount over a system folder.
+
+If a newer app version ships changed scripts, the menu shows **update needed** and keeps asking for your password until you click it. Turn the toggle off to remove both files, or run:
+```bash
+sudo /Applications/NTFS\ Drive.app/Contents/Resources/uninstall-helper.sh
+```
 
 ## Troubleshooting
 | Message | Fix |
@@ -75,13 +90,13 @@ To see what the app detects: `"/Applications/NTFS Drive.app/Contents/MacOS/NTFSD
 src/NTFSDrive.swift         menu bar app (AppKit + DiskArbitration auto-mount + notifications)
 scripts/mount-ntfs.sh       mounts NTFS partitions read/write with ntfs-3g
 scripts/eject-ntfs.sh       unmounts and ejects NTFS disks, reports apps keeping them busy
+scripts/install-helper.sh   enables password-free mounting (root-owned copies + narrow sudoers rule)
+scripts/uninstall-helper.sh disables it again
 icon/                       app icon (.icns), preview PNG, and the Python script that draws it
 build.sh                    compiles (universal), packages and signs "NTFS Drive.app"
 ```
 
 ## Roadmap
-- Enter your password once instead of on every mount (privileged helper)
-- Custom names for partitions
 - Detect and help fix hibernated or not-cleanly-closed drives
 - Setup wizard that checks macFUSE, ntfs-3g, kernel extension approval and Full Disk Access
 - Downloadable `.dmg` release / Homebrew cask

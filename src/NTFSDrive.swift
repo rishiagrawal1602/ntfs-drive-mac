@@ -15,6 +15,12 @@ struct NTFSPartition {
     let size: String        // e.g. "101.6 GB"
     var mountPoint: String? // nil = not mounted
     var readWrite: Bool     // true when mounted through macFUSE/ntfs-3g
+    var uuid: String?       // stable volume/partition UUID (survives replugging)
+
+    var customName: String? { uuid.flatMap { Settings.names[$0] } }
+    var displayName: String { customName ?? label }
+    /// Argument for mount-ntfs.sh: "disk4s1" or "disk4s1:Photos".
+    var mountArg: String { customName.map { "\(id):\($0)" } ?? id }
 
     var freeSpace: String? {
         guard let mp = mountPoint,
@@ -77,10 +83,52 @@ enum DiskScanner {
                 }
             }
             result.append(NTFSPartition(id: id, disk: currentDisk, label: label, size: size,
-                                        mountPoint: mp, readWrite: rw))
+                                        mountPoint: mp, readWrite: rw, uuid: uuid(for: id)))
         }
         return result
     }
+
+    /// Volume UUID (or partition UUID as a fallback) via DiskArbitration — no subprocess.
+    static func uuid(for bsd: String) -> String? {
+        guard let session = DASessionCreate(kCFAllocatorDefault),
+              let disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, bsd),
+              let desc = DADiskCopyDescription(disk) as? [CFString: Any] else { return nil }
+        for key in [kDADiskDescriptionVolumeUUIDKey, kDADiskDescriptionMediaUUIDKey] {
+            if let v = desc[key], CFGetTypeID(v as CFTypeRef) == CFUUIDGetTypeID() {
+                return CFUUIDCreateString(kCFAllocatorDefault, (v as! CFUUID)) as String
+            }
+        }
+        return nil
+    }
+}
+
+/// Same rules as sanitize() in mount-ntfs.sh: a safe single path component, max 32 chars.
+func sanitizeName(_ s: String) -> String {
+    let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _.-")
+    var n = String(String.UnicodeScalarView(s.unicodeScalars.filter { allowed.contains($0) }).prefix(32))
+    while n.hasPrefix(".") { n.removeFirst() }
+    return n.trimmingCharacters(in: .whitespaces)
+}
+
+// MARK: - Privileged helper (password-free mounting via a narrow sudoers rule)
+
+enum Helper {
+    static let dir = "/Library/PrivilegedHelperTools/com.local.ntfsdrive"
+    static let sudoers = "/etc/sudoers.d/ntfs-drive"
+    static let scripts = ["mount-ntfs", "eject-ntfs"]
+
+    static var installed: Bool {
+        FileManager.default.fileExists(atPath: sudoers)
+            && scripts.allSatisfy { FileManager.default.isExecutableFile(atPath: "\(dir)/\($0).sh") }
+    }
+    /// Installed copies match the scripts bundled in this version of the app.
+    static var upToDate: Bool {
+        scripts.allSatisfy { name in
+            guard let bundled = Bundle.main.path(forResource: name, ofType: "sh") else { return false }
+            return FileManager.default.contentsEqual(atPath: bundled, andPath: "\(dir)/\(name).sh")
+        }
+    }
+    static var usable: Bool { installed && upToDate }
 }
 
 // MARK: - Settings
@@ -94,6 +142,11 @@ enum Settings {
     static var keepClean: Bool {
         get { d.object(forKey: "keepClean") as? Bool ?? true }
         set { d.set(newValue, forKey: "keepClean") }
+    }
+    /// Custom partition names keyed by volume UUID.
+    static var names: [String: String] {
+        get { d.dictionary(forKey: "names") as? [String: String] ?? [:] }
+        set { d.set(newValue, forKey: "names") }
     }
 }
 
@@ -116,10 +169,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         startDiskWatcher()
         refreshIcon()
+        // Opened by hand: show the menu so the user sees something happen. Skip right after
+        // login when "Launch at login" started it automatically.
+        let startedAtLogin = SMAppService.mainApp.status == .enabled && ProcessInfo.processInfo.systemUptime < 180
+        if !startedAtLogin {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.showMenuAtMouse() }
+        }
     }
 
     // Rebuild the menu every time it opens so it always shows live state.
     func menuNeedsUpdate(_ menu: NSMenu) { buildMenu() }
+
+    /// Opening the app again (Finder, Dock, Spotlight, Launchpad) pops the menu up at the mouse
+    /// pointer, so it's reachable even when the menu bar icon is hidden behind the notch.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showMenuAtMouse()
+        return false
+    }
+
+    private func showMenuAtMouse() {
+        NSApp.activate(ignoringOtherApps: true)
+        buildMenu()
+        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+    }
 
     // MARK: Menu
 
@@ -142,7 +214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             else if p.readWrite { state = "Read/Write" }
             else { state = "Read-only" }
             let free = p.freeSpace.map { " · \($0) free" } ?? ""
-            let item = NSMenuItem(title: "\(p.label)  —  \(p.size)\(free)", action: nil, keyEquivalent: "")
+            let item = NSMenuItem(title: "\(p.displayName)  —  \(p.size)\(free)", action: nil, keyEquivalent: "")
             item.image = NSImage(systemSymbolName: p.readWrite ? "checkmark.circle.fill" : "lock.circle",
                                  accessibilityDescription: state)
             let sub = NSMenu()
@@ -154,7 +226,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 sub.addItem(actionItem("Open in Finder", #selector(openInFinder(_:)), mp))
             }
             if !p.readWrite {
-                sub.addItem(actionItem("Mount Read/Write", #selector(mountOne(_:)), p.id))
+                sub.addItem(actionItem("Mount Read/Write", #selector(mountOne(_:)), p.mountArg))
+            }
+            if p.uuid != nil {
+                sub.addItem(actionItem("Rename…", #selector(rename(_:)), p.id))
             }
             sub.addItem(actionItem("Eject Disk (\(p.disk), all partitions)", #selector(ejectOne(_:)), p.disk))
             item.submenu = sub
@@ -171,6 +246,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(ejectAll)
 
         menu.addItem(.separator())
+        let pwTitle = Helper.installed && !Helper.upToDate
+            ? "Password-free mounting (update needed…)" : "Password-free mounting"
+        menu.addItem(toggleItem(pwTitle, #selector(togglePasswordFree), Helper.installed))
         menu.addItem(toggleItem("Auto-mount when plugged in", #selector(toggleAutoMount), Settings.autoMount))
         menu.addItem(toggleItem("Keep drive clean (no ._ / .DS_Store files)", #selector(toggleClean), Settings.keepClean))
         menu.addItem(toggleItem("Launch at login", #selector(toggleLogin),
@@ -202,7 +280,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let id = sender.representedObject as? String else { return }
         mount([id], automatic: false)
     }
-    @objc private func mountAll() { mount([], automatic: false) }
+    @objc private func mountAll() {
+        mount(DiskScanner.scan().filter { !$0.readWrite }.map(\.mountArg), automatic: false)
+    }
+    @objc private func rename(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let p = DiskScanner.scan().first(where: { $0.id == id }), let uuid = p.uuid else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Rename \(p.displayName)"
+        alert.informativeText = "Letters, numbers, spaces, - _ . (max 32). Leave empty to use the default name."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = p.customName ?? ""
+        field.placeholderString = p.label
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        var names = Settings.names
+        let clean = sanitizeName(field.stringValue)
+        names[uuid] = clean.isEmpty ? nil : clean
+        Settings.names = names
+        if p.readWrite {
+            notify("Name saved", "\"\(clean.isEmpty ? p.label : clean)\" shows in Finder the next time the drive is mounted.")
+        }
+    }
+    @objc private func togglePasswordFree() {
+        let res = Bundle.main.resourcePath ?? ""
+        if Helper.installed && Helper.upToDate {
+            let (out, cancelled) = runAdmin("\(res)/uninstall-helper.sh", [])
+            if !cancelled { notify("Password-free mounting off", out.isEmpty ? "You'll be asked for your password again." : out) }
+        } else {
+            // Install, or update copies left by an older version of the app.
+            let (out, cancelled) = runAdmin("\(res)/install-helper.sh", [NSUserName(), res])
+            if cancelled { return }
+            if Helper.usable {
+                notify("Password-free mounting on", "Mounting and ejecting won't ask for your password anymore.")
+            } else {
+                notify("Couldn't enable password-free mounting", String(out.suffix(200)))
+            }
+        }
+    }
     @objc private func ejectOne(_ sender: NSMenuItem) {
         guard let d = sender.representedObject as? String else { return }
         eject([d])
@@ -222,35 +341,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // MARK: Mount / Eject (privileged via the standard macOS admin prompt)
+    // MARK: Mount / Eject
+    // Uses the password-free helper (sudo -n, root-owned script copies) when installed,
+    // otherwise the standard macOS admin password prompt.
 
     private func resource(_ name: String) -> String {
         Bundle.main.path(forResource: name, ofType: "sh") ?? ""
     }
 
-    /// Runs a bundled script as root via `do shell script … with administrator privileges`.
-    /// Returns (output, cancelled).
-    private func runPrivileged(_ script: String, env: String, args: [String]) -> (String, Bool) {
-        let safeArgs = args.filter { $0.range(of: #"^disk\d+(s\d+)?$"#, options: .regularExpression) != nil }
-        let cmd = ([env, "'\(script)'"] + safeArgs).joined(separator: " ") + " 2>&1"
-        let src = "do shell script \"\(cmd)\" with administrator privileges"
+    /// Only partition/disk ids, optionally with a sanitized custom name, are ever passed on.
+    private func validArgs(_ args: [String]) -> [String] {
+        args.compactMap { a in
+            let parts = a.split(separator: ":", maxSplits: 1).map(String.init)
+            guard let id = parts.first, id.range(of: #"^disk\d+(s\d+)?$"#, options: .regularExpression) != nil
+            else { return nil }
+            if parts.count == 2 { let n = sanitizeName(parts[1]); return n.isEmpty ? id : "\(id):\(n)" }
+            return id
+        }
+    }
+
+    private static func shQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+
+    /// Runs a script as root via `do shell script … with administrator privileges` (password prompt).
+    /// Must be called on the main thread. Returns (output, cancelled).
+    private func runAdmin(_ script: String, _ args: [String]) -> (String, Bool) {
+        let cmd = ([script] + args).map(Self.shQuote).joined(separator: " ") + " 2>&1"
+        let esc = cmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         var err: NSDictionary?
-        let out = NSAppleScript(source: src)?.executeAndReturnError(&err)
+        let out = NSAppleScript(source: "do shell script \"\(esc)\" with administrator privileges")?
+            .executeAndReturnError(&err)
         if let err = err {
-            let code = err[NSAppleScript.errorNumber] as? Int ?? 0
-            if code == -128 { return ("", true) }
+            if (err[NSAppleScript.errorNumber] as? Int) == -128 { return ("", true) }
             return ((err[NSAppleScript.errorMessage] as? String) ?? "Unknown error", false)
         }
         return (out?.stringValue ?? "", false)
     }
 
-    private func mount(_ ids: [String], automatic: Bool) {
+    /// Runs one of the helper scripts as root; calls back on the main thread with (output, cancelled).
+    private func runRoot(_ name: String, _ args: [String], completion: @escaping (String, Bool) -> Void) {
+        let args = (name == "mount-ntfs" ? [Settings.keepClean ? "--clean" : "--no-clean"] : []) + validArgs(args)
+        if Helper.usable {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+                p.arguments = ["-n", "\(Helper.dir)/\(name).sh"] + args
+                let pipe = Pipe()
+                p.standardOutput = pipe
+                p.standardError = pipe
+                var out = ""
+                do {
+                    try p.run()
+                    out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                    p.waitUntilExit()
+                } catch { out = "password is required" }
+                DispatchQueue.main.async {
+                    if out.contains("password is required") {
+                        // Rule missing or changed: fall back to the password prompt.
+                        let r = self.runAdmin(self.resource(name), args)
+                        completion(r.0, r.1)
+                    } else {
+                        completion(out, false)
+                    }
+                }
+            }
+        } else {
+            // Let the menu close before the password dialog appears.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                let r = self.runAdmin(self.resource(name), args)
+                completion(r.0, r.1)
+            }
+        }
+    }
+
+    private func mount(_ args: [String], automatic: Bool) {
         guard !busy else { return }
         busy = true
-        let env = "NTFS_CLEAN=\(Settings.keepClean ? 1 : 0)"
-        // Let the menu close / UI settle before the password dialog appears.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [self] in
-            let (out, cancelled) = runPrivileged(resource("mount-ntfs"), env: env, args: ids)
+        runRoot("mount-ntfs", args) { [self] out, cancelled in
             busy = false
             refreshIcon()
             if cancelled {
@@ -278,8 +444,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func eject(_ disks: [String]) {
         guard !busy else { return }
         busy = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [self] in
-            let (out, cancelled) = runPrivileged(resource("eject-ntfs"), env: "", args: disks)
+        runRoot("eject-ntfs", disks) { [self] out, cancelled in
             busy = false
             refreshIcon()
             if cancelled { return }
@@ -332,7 +497,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let work = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             let todo = DiskScanner.scan().filter { !$0.readWrite && !self.declinedDisks.contains($0.disk) }
-            if !todo.isEmpty { self.mount(todo.map(\.id), automatic: true) }
+            if !todo.isEmpty { self.mount(todo.map(\.mountArg), automatic: true) }
         }
         pendingAutoMount = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)
@@ -401,8 +566,9 @@ if CommandLine.arguments.contains("--scan") {
     if parts.isEmpty { print("No external NTFS partitions found.") }
     for p in parts {
         let state = p.mountPoint == nil ? "not mounted" : (p.readWrite ? "read/write" : "read-only")
-        print("\(p.id)\t\(p.disk)\t\(p.label)\t\(p.size)\t\(state)\t\(p.mountPoint ?? "-")\t\(p.freeSpace ?? "-") free")
+        print("\(p.id)\t\(p.disk)\t\(p.displayName)\t\(p.size)\t\(state)\t\(p.mountPoint ?? "-")\t\(p.freeSpace ?? "-") free\tuuid=\(p.uuid ?? "-")")
     }
+    print("password-free helper: \(Helper.installed ? (Helper.upToDate ? "installed" : "installed (outdated)") : "not installed")")
     exit(0)
 }
 
